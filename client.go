@@ -1,7 +1,7 @@
-
 package geerpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call represents an active RPC.  RPC调用的参数
@@ -26,20 +27,64 @@ func (call *Call) done() {
 	call.Done <- call
 }
 
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	// close the connection if client is nil
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+// Dial connects to an RPC server at the specified network address
+func Dial(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewClient, network, address, opts...)
+}
+
 // Client represents an RPC Client.
 // There may be multiple outstanding Calls associated
 // with a single Client, and a Client may be used by
 // multiple goroutines simultaneously.
-type Client struct {   // 客户端数据结构
-	cc       codec.Codec   // 消息编码器
+type Client struct { // 客户端数据结构
+	cc       codec.Codec // 消息编码器
 	opt      *Option
-	sending  sync.Mutex // protect following 互斥锁
-	header   codec.Header // 当前消息的消息头
-	mu       sync.Mutex // protect following
-	seq      uint64     // 请求编号
-	pending  map[uint64]*Call  // 未处理完的请求
-	closing  bool // user has called Close
-	shutdown bool // server has told us to stop
+	sending  sync.Mutex       // protect following 互斥锁
+	header   codec.Header     // 当前消息的消息头
+	mu       sync.Mutex       // protect following
+	seq      uint64           // 请求编号
+	pending  map[uint64]*Call // 未处理完的请求
+	closing  bool             // user has called Close
+	shutdown bool             // server has told us to stop
 }
 
 var _ io.Closer = (*Client)(nil)
@@ -175,9 +220,15 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 
 // Call invokes the named function, waits for it to complete,
 // and returns its error status.
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }
 
 func parseOptions(opts ...*Option) (*Option, error) {
@@ -221,23 +272,4 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	}
 	go client.receive()
 	return client
-}
-
-// Dial connects to an RPC server at the specified network address
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-	opt, err := parseOptions(opts...)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.Dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-	// close the connection if client is nil
-	defer func() {
-		if err != nil {
-			_ = conn.Close()
-		}
-	}()
-	return NewClient(conn, opt)
 }

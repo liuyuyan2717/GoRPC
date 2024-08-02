@@ -35,7 +35,7 @@ func startServer(addr chan string) {
 func main() {
 	log.SetFlags(0)
 	addr := make(chan string)
-	go startServer(addr)
+	go startServer(addr) // 开启服务
 	client, _ := geerpc.Dial("tcp", <-addr)
 	defer func() { _ = client.Close() }()
 
